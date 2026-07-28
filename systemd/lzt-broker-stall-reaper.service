@@ -1,0 +1,31 @@
+[Unit]
+Description=LZT broker stall reaper (TCP-level watchdog for self-hosted runner)
+Documentation=man:lzt-broker-stall-reaper(8)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/lzt-broker-stall-reaper -interval=30s -stall=5m
+User=root
+Group=root
+# MemoryMax cap per ~/.claude/rules/memory-awareness.md
+MemoryMax=16M
+# Capabilities required for ss --kill (tcp_diag)
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_PTRACE
+AmbientCapabilities=CAP_NET_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+# State + prom dirs are read-write
+ReadWritePaths=/var/run/lzt-broker-stall-reaper /var/lib/prometheus/node-exporter /var/log
+LogsDirectory=lzt-broker-stall-reaper
+RuntimeDirectory=lzt-broker-stall-reaper
+RuntimeDirectoryMode=0755
+StateDirectory=lzt-broker-stall-reaper
+StateDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target

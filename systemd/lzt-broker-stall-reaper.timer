@@ -1,0 +1,13 @@
+[Unit]
+Description=LZT broker stall reaper timer (every 30s)
+Documentation=man:lzt-broker-stall-reaper(8)
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=5s
+# Random jitter to avoid thundering herd with other 30s timers
+RandomizedDelaySec=3s
+
+[Install]
+WantedBy=timers.target

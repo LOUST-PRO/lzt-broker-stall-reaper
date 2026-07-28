@@ -1,0 +1,10 @@
+# Build artifacts
+lzt-broker-stall-reaper
+*.test
+*.out
+
+# Go workspace
+vendor/
+
+# State + runtime
+/state/
