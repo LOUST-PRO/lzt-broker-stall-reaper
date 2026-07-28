@@ -1,5 +1,5 @@
-# Build artifacts
-lzt-broker-stall-reaper
+# Build artifacts (root only — do not match cmd/lzt-broker-stall-reaper/ source dir)
+/lzt-broker-stall-reaper
 *.test
 *.out
 
