@@ -27,11 +27,6 @@ import (
 	"time"
 )
 
-const (
-	brokerHost = "20.85.130.105"
-	brokerPort = "443"
-)
-
 var (
 	interval      = flag.Duration("interval", 30*time.Second, "watch loop period")
 	stallThresh   = flag.Duration("stall", 5*time.Minute, "no-bytes-received threshold")
@@ -39,6 +34,9 @@ var (
 	runnerSvc     = flag.String("runner-service", "actions.runner.LOUST-PRO.vps-runner-1.service", "systemd service to restart after kill")
 	stateDir      = flag.String("state-dir", "/var/run/lzt-broker-stall-reaper", "state directory (per-connection last-bytes-received files)")
 	promDir       = flag.String("prom-dir", "/var/lib/prometheus/node-exporter", "Prometheus textfile collector directory")
+	brokerHost    = flag.String("broker-host", "20.85.130.105", "broker IPv4 address or hostname")
+	brokerPort    = flag.String("broker-port", "443", "broker TCP port")
+	appStallCtr   = flag.String("app-stall-counter-file", "/var/run/lzt-runner-stall-counter", "path to C#-patch stall counter; > 0 forces kill regardless of TCP bytes")
 	once          = flag.Bool("once", false, "single check, exit 0")
 	restartCooldn = flag.Duration("restart-cooldown", 30*time.Minute, "min time between runner service restarts")
 	logToJournald = flag.Bool("syslog", true, "log via logger(1) to syslog/journald")
@@ -78,6 +76,12 @@ func main() {
 // emit metrics, kill stalled sockets.
 func check() {
 	now := time.Now()
+
+	appStall := readAppStallCounter(*appStallCtr)
+	if appStall > 0 {
+		logf("app-stall-counter=%d forcing kill on all matched conns", appStall)
+	}
+
 	conns, err := listRunnerToBrokerConns()
 	if err != nil {
 		logf("list conns: %v", err)
@@ -107,6 +111,11 @@ func check() {
 				}
 			}
 		}
+
+		// If C# patch reported a stall, force-kill this connection
+		if appStall > 0 {
+			stalled = append(stalled, c.inode)
+		}
 	}
 
 	// Persist current state
@@ -123,14 +132,15 @@ func check() {
 
 	emitMetrics(metrics{
 		runnerProc:     *runnerProc,
-		brokerHost:     brokerHost,
-		brokerPort:     brokerPort,
+		brokerHost:     *brokerHost,
+		brokerPort:     *brokerPort,
 		connCount:      len(conns),
 		stallCount:     len(stalled),
 		killedCount:    killed,
 		restarted:      restarted,
 		lastRun:        now.Unix(),
 		hasWorker:      workerProcessExists(),
+		appStallCount:  appStall,
 	})
 }
 
@@ -140,6 +150,7 @@ type metrics struct {
 	restarted                          bool
 	lastRun                            int64
 	hasWorker                          bool
+	appStallCount                      int64
 }
 
 func emitMetrics(m metrics) {
@@ -180,6 +191,10 @@ func emitMetrics(m metrics) {
 	fmt.Fprintf(w, "# TYPE lzt_broker_stall_reaper_worker_present gauge\n")
 	fmt.Fprintf(w, "lzt_broker_stall_reaper_worker_present %d\n", boolToInt(m.hasWorker))
 
+	fmt.Fprintf(w, "# HELP lzt_broker_stall_reaper_app_stall_count C# patch stall counter value (0=healthy, >0=broker returning nulls)\n")
+	fmt.Fprintf(w, "# TYPE lzt_broker_stall_reaper_app_stall_count gauge\n")
+	fmt.Fprintf(w, "lzt_broker_stall_reaper_app_stall_count %d\n", m.appStallCount)
+
 	if err := w.Flush(); err != nil {
 		logf("write prom: %v", err)
 	}
@@ -198,22 +213,15 @@ type connInfo struct {
 	bytesReceived int64
 }
 
-// listRunnerToBrokerConns runs `ss -tnpi dst 20.85.130.105:443` and parses
-// entries owned by the runner process. Returns per-connection bytes_received.
+// listRunnerToBrokerConns runs `ss -tni dst <broker>:<port>` and parses every
+// ESTABLISHED entry. We drop `ss -p` because iproute2 omits users:(...) info
+// when CAP_DAC_OVERRIDE is not in the calling process permitted set — which
+// is the case under the systemd unit's CapabilityBoundingSet restriction.
+// On a single-runner VPS these are necessarily the runner's connections.
 func listRunnerToBrokerConns() ([]connInfo, error) {
-	out, err := exec.Command("ss", "-tnpi", "dst", brokerHost+":"+brokerPort).Output()
+	out, err := exec.Command("ss", "-tni", "dst", *brokerHost+":"+*brokerPort).Output()
 	if err != nil {
 		return nil, fmt.Errorf("ss: %w", err)
-	}
-
-	var runnerPIDs []string
-	pidsOut, err := exec.Command("pgrep", "-f", *runnerProc).Output()
-	if err == nil {
-		for _, line := range strings.Split(strings.TrimSpace(string(pidsOut)), "\n") {
-			if line != "" {
-				runnerPIDs = append(runnerPIDs, line)
-			}
-		}
 	}
 
 	var conns []connInfo
@@ -223,18 +231,6 @@ func listRunnerToBrokerConns() ([]connInfo, error) {
 		if !strings.HasPrefix(line, "ESTAB") {
 			continue
 		}
-		// Filter by pid in `users:(("Runner.Listener",pid=NNN,fd=NN))`
-		isRunner := false
-		for _, pid := range runnerPIDs {
-			if strings.Contains(line, fmt.Sprintf("pid=%s", pid)) {
-				isRunner = true
-				break
-			}
-		}
-		if !isRunner {
-			continue
-		}
-
 		ci := parseConnInfo(line)
 		if ci != nil {
 			conns = append(conns, *ci)
@@ -258,7 +254,7 @@ func parseConnInfo(line string) *connInfo {
 	if len(fields) < 4 {
 		return nil
 	}
-	localAddr := fields[2]
+	localAddr := fields[3]
 	ci := &connInfo{inode: localAddr} // use local_addr as key
 	// extract bytes_received:N
 	for _, f := range strings.Fields(line) {
@@ -331,7 +327,7 @@ func killStalledConns(inodes []string) int {
 		// `ss --kill state established dst 20.85.130.105:443`
 		// Note: ss --kill may need root/CAP_NET_ADMIN.
 		cmd := exec.Command("ss", "--kill", "state", "established",
-			"dst", brokerHost+":"+brokerPort)
+			"dst", *brokerHost+":"+*brokerPort)
 		// ss --kill doesn't accept per-inode filter; it kills all matching.
 		// We accept over-kill: any stalled conn → kill all matching.
 		out, err := cmd.CombinedOutput()
@@ -390,4 +386,45 @@ func logf(format string, a ...interface{}) {
 		_ = exec.Command("logger", "-t", "lzt-broker-stall-reaper", msg).Run()
 	}
 	log.Println(msg)
+}
+
+// readAppStallCounter parses the C#-patch stall counter file. Returns the
+// stall signal value: > 0 means force-kill needed.
+//
+// Supports two formats written by runner-1's LZT stall detector:
+//   - Pure integer (e.g., "1\n"): C# patch wrote File.WriteAllText with
+//     just a count. If > 0, file is truncated to "0" after read (consumed).
+//   - Structured log lines (current C# patch, AppendAllText):
+//     "{ISO8601 timestamp}|stall_detected|threshold=N|time_limit_sec=N"
+//     Multiple lines append over time. Presence of any |stall_detected|
+//     marker triggers force-kill. File is NOT truncated.
+func readAppStallCounter(path string) int64 {
+	if path == "" {
+		return 0
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	content := strings.TrimSpace(string(data))
+	if content == "" {
+		return 0
+	}
+
+	// Format 1: pure integer. Reject if content also contains "|"
+	// (otherwise Sscanf would happily parse "2026" from "2026-...|stall...")
+	var n int64
+	if _, err := fmt.Sscanf(content, "%d", &n); err == nil && !strings.Contains(content, "|") {
+		_ = os.WriteFile(path, []byte("0\n"), 0o644)
+		return n
+	}
+
+	// Format 2: structured log lines. Count |stall_detected| occurrences.
+	var stallLines int64
+	for _, line := range strings.Split(content, "\n") {
+		if strings.Contains(line, "|stall_detected|") {
+			stallLines++
+		}
+	}
+	return stallLines
 }
