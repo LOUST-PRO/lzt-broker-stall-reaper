@@ -413,9 +413,18 @@ func readAppStallCounter(path string) int64 {
 
 	// Format 1: pure integer. Reject if content also contains "|"
 	// (otherwise Sscanf would happily parse "2026" from "2026-...|stall...")
+	//
+	// Use OpenFile(O_WRONLY|O_TRUNC, 0) instead of WriteFile to preserve
+	// the inode + existing perms when tmpfiles.d set 0664. WriteFile would
+	// re-apply 0644 (umask default) if the file is missing between cycles
+	// and the reaper creates it first, losing the runner user's group-write
+	// bit and causing EACCES on the next AppendAllText.
 	var n int64
 	if _, err := fmt.Sscanf(content, "%d", &n); err == nil && !strings.Contains(content, "|") {
-		_ = os.WriteFile(path, []byte("0\n"), 0o644)
+		if f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0); err == nil {
+			_, _ = f.WriteString("0\n")
+			_ = f.Close()
+		}
 		return n
 	}
 
